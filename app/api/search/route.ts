@@ -15,20 +15,31 @@ function parseJson(text: string): any[] {
   }
 }
 
-async function generateWithAI(query: string, apiKey: string, url: string, model: string, sourceName: string) {
-  const prompt = `You are an expert Malaysia travel guide with deep local knowledge of every state and territory.
+// Remove duplicates by name (case insensitive)
+function deduplicate(places: any[]): any[] {
+  const seen = new Set<string>();
+  return places.filter(p => {
+    const key = p.name?.toLowerCase().trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function generateWithAI(query: string, apiKey: string, url: string, model: string, sourceName: string): Promise<any[]> {
+  const prompt = `You are an expert Malaysia travel guide with deep local knowledge of every state, city, and territory.
 
 Generate 5-8 real, specific places in Malaysia for: "${query}"
 
 Requirements:
 - Include exact or approximate real addresses (street, city, state)
-- Descriptions must be 2-3 sentences with specific details (what to do, best time to visit, local tips, price range if relevant)
+- Descriptions must be 2-3 sentences with specific details (what to do, best time, local tips)
 - Categories: food, nature, shopping, history, entertainment
-- Mix of famous and hidden gems
+- Mix famous landmarks and hidden gems locals love
 - Only real places that actually exist
 
-Return ONLY a JSON array. No markdown, no explanation, no intro text.
-Format: [{"name":"Place Name","address":"123 Street Name, City, State, Malaysia","description":"Detailed description with specific tips and what makes it special. Best visited in morning/evening.","category":"food|nature|shopping|history|entertainment"}]`;
+Return ONLY a JSON array. No markdown, no explanation.
+Format: [{"name":"Place Name","address":"123 Street, City, State, Malaysia","description":"Detailed description with specific tips.","category":"food|nature|shopping|history|entertainment"}]`;
 
   const res = await fetch(url, {
     method: 'POST',
@@ -54,7 +65,9 @@ Format: [{"name":"Place Name","address":"123 Street Name, City, State, Malaysia"
   const places = parseJson(content);
   
   if (places.length === 0) throw new Error(`${sourceName} empty result`);
-  return { places, source: sourceName };
+  
+  // Tag each place with its source
+  return places.map((p: any) => ({ ...p, _source: sourceName }));
 }
 
 export async function POST(req: Request) {
@@ -65,59 +78,64 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Query is required' }, { status: 400 });
     }
 
-    // Clean query
     const cleanQuery = query.trim();
-    
-    // Build enhanced prompt with category context
     let enhancedQuery = cleanQuery;
     if (category && category !== 'all') {
       enhancedQuery = `${category} in ${cleanQuery}`;
     }
 
-    // AI-only generation — no web search, no local database
-    let result: { places: any[]; source: string } | null = null;
+    // Call ALL 3 AI services in parallel
+    const promises: Promise<any[]>[] = [];
     const errors: string[] = [];
+    const activeSources: string[] = [];
 
-    // Try Groq first (best free tier, best model)
+    // Groq
     if (process.env.GROQ_API_KEY) {
-      try {
-        result = await generateWithAI(
-          enhancedQuery, 
-          process.env.GROQ_API_KEY, 
-          'https://api.groq.com/openai/v1/chat/completions', 
-          'llama-3.1-70b-versatile', 
-          'Groq AI'
-        );
-      } catch (e: any) { errors.push(`Groq: ${e.message}`); }
+      activeSources.push('Groq');
+      promises.push(
+        generateWithAI(enhancedQuery, process.env.GROQ_API_KEY, 'https://api.groq.com/openai/v1/chat/completions', 'llama-3.1-70b-versatile', 'Groq')
+          .catch(e => { errors.push(`Groq: ${e.message}`); return []; })
+      );
     }
 
-    // Fallback to OpenRouter
-    if (!result && process.env.OPENROUTER_API_KEY) {
-      try {
-        result = await generateWithAI(
-          enhancedQuery, 
-          process.env.OPENROUTER_API_KEY, 
-          'https://openrouter.ai/api/v1/chat/completions', 
-          'mistralai/mistral-7b-instruct:free', 
-          'OpenRouter'
-        );
-      } catch (e: any) { errors.push(`OpenRouter: ${e.message}`); }
+    // OpenRouter
+    if (process.env.OPENROUTER_API_KEY) {
+      activeSources.push('OpenRouter');
+      promises.push(
+        generateWithAI(enhancedQuery, process.env.OPENROUTER_API_KEY, 'https://openrouter.ai/api/v1/chat/completions', 'mistralai/mistral-7b-instruct:free', 'OpenRouter')
+          .catch(e => { errors.push(`OpenRouter: ${e.message}`); return []; })
+      );
     }
 
-    // Fallback to Mistral direct
-    if (!result && process.env.MISTRAL_API_KEY) {
-      try {
-        result = await generateWithAI(
-          enhancedQuery, 
-          process.env.MISTRAL_API_KEY, 
-          'https://api.mistral.ai/v1/chat/completions', 
-          'mistral-tiny', 
-          'Mistral AI'
-        );
-      } catch (e: any) { errors.push(`Mistral: ${e.message}`); }
+    // Mistral
+    if (process.env.MISTRAL_API_KEY) {
+      activeSources.push('Mistral');
+      promises.push(
+        generateWithAI(enhancedQuery, process.env.MISTRAL_API_KEY, 'https://api.mistral.ai/v1/chat/completions', 'mistral-tiny', 'Mistral')
+          .catch(e => { errors.push(`Mistral: ${e.message}`); return []; })
+      );
     }
 
-    if (!result) {
+    // Wait for ALL to finish (parallel)
+    const results = await Promise.all(promises);
+
+    // Combine all results
+    let allPlaces: any[] = [];
+    results.forEach(places => {
+      allPlaces = allPlaces.concat(places);
+    });
+
+    // Remove duplicates
+    allPlaces = deduplicate(allPlaces);
+
+    // Filter by category
+    if (category && category !== 'all') {
+      allPlaces = allPlaces.filter((p: any) => 
+        p.category?.toLowerCase() === category.toLowerCase()
+      );
+    }
+
+    if (allPlaces.length === 0) {
       return NextResponse.json({
         places: [],
         source: 'none',
@@ -125,27 +143,20 @@ export async function POST(req: Request) {
         count: 0,
         debug: {
           errors,
+          activeSources,
           hasGroqKey: !!process.env.GROQ_API_KEY,
           hasOpenRouterKey: !!process.env.OPENROUTER_API_KEY,
           hasMistralKey: !!process.env.MISTRAL_API_KEY,
-          message: 'No API keys configured or all AI services failed. Add GROQ_API_KEY to Vercel env vars.',
         }
       });
     }
 
-    // Filter by category if specified
-    let finalPlaces = result.places;
-    if (category && category !== 'all') {
-      finalPlaces = result.places.filter((p: any) => 
-        p.category?.toLowerCase() === category.toLowerCase()
-      );
-    }
-
     return NextResponse.json({
-      places: finalPlaces.slice(0, 12),
-      source: result.source,
+      places: allPlaces.slice(0, 15), // up to 15 combined results
+      source: activeSources.join(' + '),
       query: enhancedQuery,
-      count: finalPlaces.length,
+      count: allPlaces.length,
+      perSource: results.map((r, i) => ({ source: activeSources[i], count: r.length })),
     });
 
   } catch (error: any) {
