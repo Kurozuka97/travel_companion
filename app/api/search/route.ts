@@ -15,31 +15,94 @@ function parseJson(text: string): any[] {
   }
 }
 
-// Remove duplicates by name (case insensitive)
+// Clean category — fix pipe-separated and invalid categories
+function cleanCategory(cat: string): string {
+  if (!cat) return 'general';
+  const clean = cat.toLowerCase().split('|')[0].trim();
+  const valid = ['food', 'nature', 'shopping', 'history', 'entertainment'];
+  return valid.includes(clean) ? clean : 'general';
+}
+
+// Clean address — remove generic/wrong locations
+function cleanAddress(addr: string, query: string): string {
+  if (!addr) return 'Malaysia';
+  
+  // Extract location from query (e.g., "langkawi", "penang", "kl")
+  const locations = ['langkawi', 'penang', 'kl', 'kuala lumpur', 'melaka', 'malacca', 'ipoh', 'johor', 'sabah', 'sarawak', 'terengganu', 'kelantan', 'pahang', 'perak', 'kedah', 'perlis', 'negeri sembilan', 'selangor', 'putrajaya', 'labuan'];
+  const queryLower = query.toLowerCase();
+  const detectedLocation = locations.find(l => queryLower.includes(l));
+  
+  // If address has wrong state, replace it
+  let cleaned = addr
+    .replace(/Kuala Terengganu|Pulau[,\s]*Terengganu/gi, '') // Remove wrong Terengganu refs
+    .replace(/,\s*Malaysia\s*$/i, '') // Remove trailing Malaysia
+    .trim();
+  
+  // Add detected location if missing
+  if (detectedLocation && !cleaned.toLowerCase().includes(detectedLocation)) {
+    cleaned = cleaned ? `${cleaned}, ${detectedLocation.charAt(0).toUpperCase() + detectedLocation.slice(1)}` : detectedLocation.charAt(0).toUpperCase() + detectedLocation.slice(1);
+  }
+  
+  return cleaned || 'Malaysia';
+}
+
+// Remove duplicates by name similarity
 function deduplicate(places: any[]): any[] {
   const seen = new Set<string>();
   return places.filter(p => {
-    const key = p.name?.toLowerCase().trim();
-    if (!key || seen.has(key)) return false;
+    const key = p.name?.toLowerCase().replace(/[^a-z0-9]/g, '').trim();
+    if (!key || key.length < 3 || seen.has(key)) return false;
     seen.add(key);
     return true;
   });
 }
 
+// Score place quality (filter out obvious hallucinations)
+function scorePlace(place: any, query: string): number {
+  let score = 0;
+  const queryLower = query.toLowerCase();
+  const nameLower = place.name?.toLowerCase() || '';
+  const addrLower = place.address?.toLowerCase() || '';
+  const descLower = place.description?.toLowerCase() || '';
+  
+  // Name contains query keyword
+  if (queryLower.split(' ').some((w: string) => nameLower.includes(w) && w.length > 2)) score += 2;
+  
+  // Has specific address (not just "Malaysia")
+  if (addrLower.length > 10 && !addrLower.includes('kuala terengganu')) score += 2;
+  
+  // Description is detailed
+  if (descLower.length > 80) score += 1;
+  
+  // Description mentions query context
+  if (queryLower.split(' ').some((w: string) => descLower.includes(w) && w.length > 2)) score += 1;
+  
+  // Has street name or area
+  if (/jalan|lorong|taman|kampung|bandar|desa|taman/i.test(addrLower)) score += 1;
+  
+  // Penalty for generic names
+  if (nameLower.includes('taman mini malaysia') && !queryLower.includes('melaka')) score -= 5; // Wrong location
+  if (addrLower.includes('kuala terengganu') && queryLower.includes('langkawi')) score -= 5; // Wrong state
+  
+  return score;
+}
+
 async function generateWithAI(query: string, apiKey: string, url: string, model: string, sourceName: string): Promise<any[]> {
-  const prompt = `You are an expert Malaysia travel guide with deep local knowledge of every state, city, and territory.
+  const prompt = `You are a local Malaysian who knows every corner of Malaysia.
 
-Generate 5-8 real, specific places in Malaysia for: "${query}"
+Task: Find real places for "${query}" in Malaysia.
 
-Requirements:
-- Include exact or approximate real addresses (street, city, state)
-- Descriptions must be 2-3 sentences with specific details (what to do, best time, local tips)
-- Categories: food, nature, shopping, history, entertainment
-- Mix famous landmarks and hidden gems locals love
-- Only real places that actually exist
+CRITICAL RULES:
+- ONLY include places that ACTUALLY EXIST in the correct location
+- Addresses must be SPECIFIC: include street name, area, and correct state
+- NEVER use generic addresses like "Jalan Pantai Cenang, Kuala Terengganu" — that's WRONG
+- Langkawi is in KEDAH, not Terengganu
+- Penang is an ISLAND state
+- KL is a federal territory surrounded by Selangor
+- Descriptions must be 2-3 sentences with SPECIFIC details (what to order, best time, how to get there, price)
 
-Return ONLY a JSON array. No markdown, no explanation.
-Format: [{"name":"Place Name","address":"123 Street, City, State, Malaysia","description":"Detailed description with specific tips.","category":"food|nature|shopping|history|entertainment"}]`;
+Return ONLY JSON array:
+[{"name":"Exact Place Name","address":"No X, Jalan XXX, Area, City, State, Malaysia","description":"Specific details. What makes it special. Best time to visit.","category":"food|nature|shopping|history|entertainment"}]`;
 
   const res = await fetch(url, {
     method: 'POST',
@@ -50,10 +113,10 @@ Format: [{"name":"Place Name","address":"123 Street, City, State, Malaysia","des
     body: JSON.stringify({
       model,
       messages: [
-        { role: 'system', content: 'You are a Malaysia travel expert. Return ONLY valid JSON array of real places. No markdown, no explanation.' },
+        { role: 'system', content: 'You are a knowledgeable local Malaysian. Return ONLY valid JSON array. Be accurate about locations.' },
         { role: 'user', content: prompt },
       ],
-      temperature: 0.3,
+      temperature: 0.2, // Lower = more factual
       max_tokens: 3000,
     }),
   });
@@ -66,7 +129,6 @@ Format: [{"name":"Place Name","address":"123 Street, City, State, Malaysia","des
   
   if (places.length === 0) throw new Error(`${sourceName} empty result`);
   
-  // Tag each place with its source
   return places.map((p: any) => ({ ...p, _source: sourceName }));
 }
 
@@ -81,7 +143,7 @@ export async function POST(req: Request) {
     const cleanQuery = query.trim();
     let enhancedQuery = cleanQuery;
     if (category && category !== 'all') {
-      enhancedQuery = `${category} in ${cleanQuery}`;
+      enhancedQuery = `${category} ${cleanQuery}`;
     }
 
     // Call ALL 3 AI services in parallel
@@ -89,7 +151,6 @@ export async function POST(req: Request) {
     const errors: string[] = [];
     const activeSources: string[] = [];
 
-    // Groq
     if (process.env.GROQ_API_KEY) {
       activeSources.push('Groq');
       promises.push(
@@ -98,7 +159,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // OpenRouter
     if (process.env.OPENROUTER_API_KEY) {
       activeSources.push('OpenRouter');
       promises.push(
@@ -107,7 +167,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // Mistral
     if (process.env.MISTRAL_API_KEY) {
       activeSources.push('Mistral');
       promises.push(
@@ -116,23 +175,35 @@ export async function POST(req: Request) {
       );
     }
 
-    // Wait for ALL to finish (parallel)
     const results = await Promise.all(promises);
 
-    // Combine all results
+    // Combine, clean, score, deduplicate
     let allPlaces: any[] = [];
     results.forEach(places => {
       allPlaces = allPlaces.concat(places);
     });
+
+    // Clean and score each place
+    allPlaces = allPlaces.map(p => ({
+      name: p.name?.trim() || 'Unknown',
+      address: cleanAddress(p.address, cleanQuery),
+      description: p.description?.trim() || '',
+      category: cleanCategory(p.category),
+      _source: p._source,
+    }));
+
+    // Filter out low-quality results (score < 1)
+    allPlaces = allPlaces.filter(p => scorePlace(p, cleanQuery) >= 1);
+
+    // Sort by score (best first)
+    allPlaces.sort((a, b) => scorePlace(b, cleanQuery) - scorePlace(a, cleanQuery));
 
     // Remove duplicates
     allPlaces = deduplicate(allPlaces);
 
     // Filter by category
     if (category && category !== 'all') {
-      allPlaces = allPlaces.filter((p: any) => 
-        p.category?.toLowerCase() === category.toLowerCase()
-      );
+      allPlaces = allPlaces.filter((p: any) => p.category === category.toLowerCase());
     }
 
     if (allPlaces.length === 0) {
@@ -141,18 +212,12 @@ export async function POST(req: Request) {
         source: 'none',
         query: enhancedQuery,
         count: 0,
-        debug: {
-          errors,
-          activeSources,
-          hasGroqKey: !!process.env.GROQ_API_KEY,
-          hasOpenRouterKey: !!process.env.OPENROUTER_API_KEY,
-          hasMistralKey: !!process.env.MISTRAL_API_KEY,
-        }
+        debug: { errors, activeSources }
       });
     }
 
     return NextResponse.json({
-      places: allPlaces.slice(0, 15), // up to 15 combined results
+      places: allPlaces.slice(0, 12),
       source: activeSources.join(' + '),
       query: enhancedQuery,
       count: allPlaces.length,
